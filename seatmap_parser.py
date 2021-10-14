@@ -1,209 +1,156 @@
-import sys
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as Et
 import json
+import re
 
-xml_doc = str(sys.argv[1])
-tree = ET.parse(xml_doc)
-root = tree.getroot()
+seat_map_one_tree = Et.parse('seatmap1.xml')
+seat_map_two_tree = Et.parse('seatmap2.xml')
 
-#This section is going to make some assumptions in regards to scalability. The XML documents provided either come from IATA or #Opentravel, and the biggest assumption in regards to this is that IATA follows one format consistently, and Opentravel follows the #other. 
-#Here is where we'll find out which file is presented and how it will be handled.
-Rows = []
-class FlightObject:
-    def __init__ (self, departure_date_time, departure_loc, arrival_loc, equipment_type, row):
-        self.departure_date_time = departure_date_time
-        self.departure_loc = departure_loc
-        self.arrival_loc = arrival_loc
-        self.equipment_type = equipment_type
-        self.row = row
 
-class RowObject:
-    def __init__ (self, class_type, row_numbers, seat):
-        self.class_type = class_type
-        self.row_numbers = row_numbers
-        self.seat = seat
+def parse_flight_data(seat_map_tree):
+    flight_data = {}
+    flight_data_root = seat_map_tree.getroot()
+    plane_seat_map = []
+    seats = []
+    for ele in flight_data_root.findall(".//{http://www.opentravel.org/OTA/2003/05/common/}FlightSegmentInfo"):
+        flight_data["departure_time"] = ele.attrib["DepartureDateTime"]
+        flight_data["flight_number"] = ele.attrib["FlightNumber"]
 
-class SeatObject:
-    def __init__ (self, seat_id, avail_status, feature, price):
-        self.seat_id = seat_id
-        self.avail_status = avail_status
-        self.feature = feature
-        self.price = price
+    curr_dict = {"features": "", 'price': "NA"}
+    for ele in flight_data_root.findall(".//{http://www.opentravel.org/OTA/2003/05/common/}*"):
+        if ele.tag == "{http://www.opentravel.org/OTA/2003/05/common/}Summary":
+            row_atr = ele.attrib
+            curr_dict["seat_number"] = ele.attrib["SeatNumber"]
+            curr_dict["is_available"] = ele.attrib["AvailableInd"]
 
-#This section is for OpenTravel xml processing. In the event that there's a bit that IATA will use, these will be recycled, but
-#IATA and OpenTravel apparently didn't get each other's memos on how to build their respective websites.
+        if ele.tag == "{http://www.opentravel.org/OTA/2003/05/common/}Features":
+            row_txt = ele.text
+            final_txt = ""
+            if row_txt == "Other_":
+                final_txt = "Chargable"
+            else:
+                final_txt = row_txt
+            curr_dict["features"] = final_txt
+        if ele.tag == "{http://www.opentravel.org/OTA/2003/05/common/}Fee":
+            row_atr = ele.attrib
+            x = slice(2) # take two elements
+            curr_dict["price"] = f"{row_atr['Amount'][x]}.00 {row_atr['CurrencyCode']}"
+        if ele.tag == "{http://www.opentravel.org/OTA/2003/05/common/}SeatInfo" and len(curr_dict) > 2:
+            seats.append(curr_dict)
+            curr_dict = {"features": "", 'price': "NA"}
 
-def strip_url_from_tag(child_info):
-    entire_tag = str(child_info)
-    url_information, unused_portion = entire_tag.split("}")
-    url_information += "}"
-    return url_information
+    for ele in flight_data_root.findall(".//{http://www.opentravel.org/OTA/2003/05/common/}RowInfo"):
+        row_atr = ele.attrib
+        new_row = {'row_number': row_atr["RowNumber"], 'cabin_type': row_atr["CabinType"], 'seats': []}
+        plane_seat_map.append(new_row)
 
-def get_information(used_dict, info_needed):
-    info = str(used_dict.get(info_needed))
-    if info_needed == 'Amount' or info_needed == 'DecimalPlaces':
-        info = make_float(info)
-    return info
+    warnings = []
+    for ele in flight_data_root.findall(".//{http://www.opentravel.org/OTA/2003/05/common/}Warning"):
+        warnings.append({'warning_code': ele.attrib["Code"], 'warning_message': ele.text})
 
-def flight_departure(url_information):
-    for flight_departure_date_time in root.iter('{}FlightSegmentInfo'.format(url_information)):
-        flight_departure_date_time = get_information(flight_departure_date_time.attrib,'DepartureDateTime')
-        return flight_departure_date_time
+    flight_data['warnings'] = warnings
+    flight_data['plane_seat_map'] = plane_seat_map
+    for item in plane_seat_map:
+        for seat in seats:
+            s_number = seat["seat_number"]
+            if item["row_number"] == re.findall("\d+", s_number)[0]:
+                item["seats"].append(seat)
 
-def departure_loc(url_information):
-    for flight_departure_loc in root.iter('{}DepartureAirport'.format(url_information)):
-        flight_departure_loc = get_information(flight_departure_loc.attrib, 'LocationCode')
-        return flight_departure_loc
+    return flight_data
 
-def arrival_loc(url_information):
-    for flight_arrival_loc in root.iter('{}ArrivalAirport'.format(url_information)):
-        flight_arrival_loc = get_information(flight_arrival_loc.attrib, 'LocationCode')
-        return flight_arrival_loc
 
-def equipment_type(url_information):
-    for flight_equip_type in root.iter('{}Equipment'.format(url_information)):
-        flight_equip_type = get_information(flight_equip_type.attrib, 'AirEquipType')
-        return flight_equip_type
+def parse_second(seatmap):
+    mapping_def = {'SD1': 'SEAT_SUITABLE_FOR_ADULT_WITH_AN_INFANT', 'SD2': 'SEAT_IN_A_QUIET_ZONE', 'SD3': 'WINDOW',
+                   'SD4': 'AVAILABLE', 'SD5': 'AISLE_SEAT', 'SD6': 'SEAT_NOT_SUITABLE_FOR_CHILD',
+                   'SD7': 'SEAT_NOT_ALLOWED_FOR_INFANT', 'SD8': 'RESTRICTED_RECLINE_SEAT',
+                   'SD9': 'SEAT_TO_BE_LEFT_VACANT_OR_OFFERED_LAST', 'SD10': 'RESTRICTED_SEAT_GENERAL',
+                   'SD11': 'RESTRICTED', 'SD12': 'WING', 'SD13': 'SEAT_NOT_ALLOWED_FOR_MEDICAL', 'SD14': 'EXIT',
+                   'SD15': 'LEG_SPACE_SEAT', 'SD16': 'PREFERENTIAL_SEAT',
+                   'SD17': 'SEAT_WITH_FACILITIES_FOR_HANDICAPPED',
+                   'SD18': 'SEAT_WITH_FACILITIES_FOR_HANDICAPPED_INCAPACITATED_PASSENGER', 'SD19': 'OCCUPIED',
+                   'SD20': 'SEAT_SUITABLE_FOR_UNACCOMPANIED_MINORS', 'SD21': 'REAR_FACING_SEAT', 'SD22': 'CREW_SEAT'}
+    prices = {"OFIa20ae42f-6417-11eb-b326-15132ca0c3353": "17.70 GBP",
+              "OFIa20ae42f-6417-11eb-b326-15132ca0c3351": "22.10",
+              "OFIa20ae42f-6417-11eb-b326-15132ca0c3352": "35.40 GBP",
+              "OFIa20ae42f-6417-11eb-b326-15132ca0c3354": "11.50 GBP"}
+    output = {}
+    rows = []
+    tree_root = seatmap.getroot()
+    for ele in tree_root:
+        if ele.tag == "{http://www.iata.org/IATA/EDIST/2017.2}SeatMap":
+            seat_map = {"seats": []}
+            for child in ele:
+                if child.tag == "{http://www.iata.org/IATA/EDIST/2017.2}Cabin":
+                    for cabin in child:
+                        if cabin.tag == "{http://www.iata.org/IATA/EDIST/2017.2}Row":
+                            for row in cabin:
+                                curr_row = row.text
+                                if row.tag == "{http://www.iata.org/IATA/EDIST/2017.2}Number":
+                                    row_number = row.text
+                                    curr_row = row.text
+                                    seat_map["row_number"] = row_number
+                                    if len(seat_map) > 0:
+                                        rows.append(seat_map)
+                                        seat_map = {"seats": []}
 
-def make_float(info_to_convert):
-    converted_to_float = float(info_to_convert)
-    return converted_to_float
+                                if row.tag == "{http://www.iata.org/IATA/EDIST/2017.2}Seat":
+                                    seat_def_refs = []
+                                    single_seat = {}
+                                    for seat in row:
+                                        if seat.tag == "{http://www.iata.org/IATA/EDIST/2017.2}OfferItemRefs":
+                                            print(seat.text)
+                                            single_seat["offer_ref"] = seat.text
+                                        if seat.tag == "{http://www.iata.org/IATA/EDIST/2017.2}Column":
+                                            single_seat["seat_id"] = f"{seat.text}"
+                                        if seat.tag == "{http://www.iata.org/IATA/EDIST/2017.2}SeatDefinitionRef":
+                                            seat_def_refs.append(seat.text)
+                                            single_seat["definitions"] = seat_def_refs
+                                    print(single_seat)
+                                    seat_map["seats"].append(single_seat)
 
-def get_seat_info(seat_dict):
-    seat_id = get_information(seat_dict, 'SeatNumber')
-    avail_status = get_information(seat_dict, 'AvailableInd')
-    if avail_status == 'false':
-        avail_status = 'Unavailable'
-    else:
-        avail_status = 'Available'
-    return seat_id, avail_status
 
-def get_fees_info(fees_dict):
-    amount = get_information(fees_dict, 'Amount')
-    decimal = get_information(fees_dict, 'DecimalPlaces')
-    currency = get_information(fees_dict, 'CurrencyCode')
-    places = 10 ** (-1 * decimal)
-    total = amount * places
-    price = '{:,.2f} '.format(total) + currency
-    return price
-
-def get_class(row_info_dict):
-    class_type = get_information(row_info_dict, 'CabinType')
-    row_number = get_information(row_info_dict, 'RowNumber')
-    return class_type, row_number
-
-def ota_flight_handling(url_information):
-    flight_departure_date_time = flight_departure(url_information)
-    flight_departure_loc = departure_loc(url_information)
-    flight_arrival_loc = arrival_loc(url_information)
-    flight_equip_type = equipment_type(url_information)
-
-    for row_info in root.iter('{}RowInfo'.format(url_information)):
-        Seats = []
-        price = ""
-        for seat_info in row_info.iter('{}SeatInfo'.format(url_information)):
-            for seat in seat_info.iter('{}Summary'.format(url_information)):
-                seat = seat.attrib
-                seat_id, avail_status = get_seat_info(seat)
-            for features in seat_info.iter('{}Features'.format(url_information)):
-                feature_check = features.text
-                if feature_check != "Other_":
-                    feature = feature_check
-            for service in seat_info.iter('{}Service'.format(url_information)):
-                for fees in service.iter('{}Fee'.format(url_information)):
-                    fees = fees.attrib
-                    price = get_fees_info(fees)
-            seat_object = SeatObject(seat_id, avail_status, feature, price)
-            seat = seat_object.__dict__
-            Seats.append(seat)
-        row_info = row_info.attrib
-        class_type, row_number = get_class(row_info)
-        row_object = RowObject(class_type, row_number, Seats)
-        row = row_object.__dict__
-        Rows.append(row)
-    flight_obect = FlightObject(flight_departure_date_time, flight_departure_loc, flight_arrival_loc, flight_equip_type, Rows)
-    return flight_obect
-
-#The following section is to handle IATA's flight information XML file. Again, any functions not found therein are likely in
-#the section above (OpenTravel's), but it's highly unlikely much code will be shared other than classes.
-#def get_price_info(url_information, offer_id):
-#    for child in root:
-#        for alacarte in child.iter('{}ALaCarteOffer'.format(url_information)):
-#            for alacarte_offer in alacarte.iter('{}ALaCarteOfferItem'.format(url_information)):
-#                print(alacarte_offer.tag, alacarte_offer.attrib)
-#                offer_item_id = get_information(alacarte_offer.attrib, 'OfferItemID')
-#                print(offer_item_id)
-#                #this should be fetching the seat and returning things specific to that seat by order item.. I think. The offer
-#                #should be checked against a passed variable. Current value is specifically for local testing for now.
-#                if offer_item_id == 'OFIa20ae42f-6417-11eb-b326-15132ca0c3354':
-#                    for eligibility in alacarte_offer.iter('{}Eligibility'.format(url_information)):
-#                        print(eligibility.attrib)
-#                        print(eligibility[0].text)
-#                    for unit_price_detail in alacarte_offer.iter('{}UnitPriceDetail'.format(url_information)):
-#                        for total_amount in unit_price_detail.iter('{}TotalAmount'.format(url_information)):
-#                            for simple_currency_price in total_amount.iter('{}SimpleCurrencyPrice'.format(url_information)):
-#                                print(simple_currency_price.attrib, simple_currency_price.text)
-def check_row(url_information):
-    layout_starting_row = []
-    for child in root:
-        for cabin in child.iter('{}Cabin'.format(url_information)):
-            for cabin_layout in cabin.iter('{}CabinLayout'.format(url_information)):
-                for rows in cabin_layout.iter('{}Rows'.format(url_information)):
-                    first = rows.find('{}First'.format(url_information))
-                    last = rows.find('{}Last'.format(url_information))
-                    layout_starting_row.append(first.text)
-                    layout_ending_row = last.text                     
-    return layout_starting_row, layout_ending_row
-
-def layout_handler(url_information):
-    first_row, last_row = check_row(url_information)
-    counter = 0
-    print(first_row)
-    for child in root:
-        for cabin in child.iter('{}Cabin'.format(url_information)):
-            print(cabin.tag, cabin.attrib)
-            for cabin_layout in cabin.iter('{}CabinLayout'.format(url_information)):
-                if len(first_row) - 1 > counter:
-                    print("First Row: ", first_row[counter], "- Last Row: ", str(int(first_row[counter+1]) - 1))
+    filter_rows = []
+    for row in rows:
+        new_obj = {}
+        rn = row["row_number"]
+        if rn is not None:
+            new_obj["row_number"] = rn
+            new_obj["seats"] = []
+            new_seat = {}
+            for seat in row["seats"]:
+                new_seat["seat_id"] = f"{rn}{seat['seat_id']}"
+                print(seat, "FJFJF")
+                if "offer_ref" in seat and "offer_ref" in prices:
+                    new_seat["price"] = prices[new_seat['offer_ref']]
                 else:
-                    print("First Row: ", first_row[counter], "- Last Row: ", last_row)
-                for columns in cabin_layout.iter('{}Columns'.format(url_information)):
-                    print(columns.attrib, columns.text)
-                counter += 1
+                    new_seat["price"] = "NA"
+                for item in seat["definitions"]:
+                    if item == "SD4":
+                        new_seat["is_available"] = True
+                    if item == "SD19":
+                        new_seat["is_available"] = False
+                    if item == "SD5":
+                        new_seat["features"] = "Aisle"
+                    if item == "SD3":
+                        new_seat["features"] = "Window"
+                    if item == "SD22":
+                        new_seat["features"] = "Center"
+
+                new_obj["seats"].append(new_seat)
+        if len(new_obj) > 0:
+            filter_rows.append(new_obj)
+
+    output["rows"] = filter_rows
+    return output
 
 
-def iata_flight_handling(url_information):
-    layout_handler(url_information)        
-                
-    print('No programming yet to handle {}. Please try again later'.format(url_information))
+print(f"parsing first xml seatmap")
+json_data = parse_flight_data(seat_map_one_tree)
+with open('seatmap1_parsed.json', "w") as json_file:
+    json.dump(json_data, json_file, indent=3)
 
-for child in root[0]:
-    if 'IATA' in child.tag:
-        print("IATA flight information recieved!")
-        url_information = strip_url_from_tag(child.tag)
-        iata_flight_handling(url_information)
-#       No code yet for this type, so I'm just going to leave this line in for later
-#         flight = iata_flight_handling(url_information)     
-    elif 'OTA' in child.tag:
-        print("OpenTravel flight information received!")
-        url_information = strip_url_from_tag(child.tag)
-        flight = ota_flight_handling(url_information)
-    else:
-        print("Invalid File Type")
+print(f"parsing second xml seatmap")
+second_tree_data = parse_second(seat_map_two_tree)
+with open('seatmap2_parsed.json', "w") as json_file:
+    json.dump(second_tree_data, json_file, indent=3)
 
-
-file_name = xml_doc.replace(".xml", "_parsed.json")
-#make certain to uncomment this before running final program
-#flight_info = flight.__dict__
-#with open(file_name, 'w') as outfile:
-#    json.dump(flight_info, outfile)
-print("Parsing complete! Parsed document found at {}".format(file_name))
-#These are helpful links to finish this project:
-#https://docs.python.org/3/library/xml.etree.elementtree.html is my ElementTree documentation
-#https://anenadic.github.io/2014-11-10-manchester/novice/python/06-cmdline-non-interactive.html is running Python from the command line
-#https://www.datacamp.com/community/tutorials/dictionary-python?utm_source=adwords_ppc&utm_campaignid=1565261270&utm_adgroupid=67750485268&utm_device=c&utm_keyword=&utm_matchtype=b&utm_network=g&utm_adpostion=&utm_creative=295208661514&utm_targetid=aud-299261629574:dsa-429603003980&utm_loc_interest_ms=&utm_loc_physical_ms=9009680&gclid=CjwKCAjw3pWDBhB3EiwAV1c5rCFSPniwB33l4PLFUr1_wJnwssiPVwmvpVDR_mxjAGd7P1dai_dbzRoC03sQAvD_BwE python dictionaries
-
-#print(flight_information)
-#This is the basic layout for the command to get the JSON file. For now, we're working on how to get it in the first place. 
-#json_file_information = json.dumps(flight_information)
-#https://www.w3schools.com/python/python_json.asp describes how to use the built in json function to convert python objects to a json file
+print(f"finished..")
